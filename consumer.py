@@ -9,6 +9,7 @@ import re
 import os
 import time
 import boto3
+import csv
 from dotenv import load_dotenv
 
 # -------------------------
@@ -43,17 +44,26 @@ reader = easyocr.Reader(['en'])
 consumer = KafkaConsumer(
     'video-stream',
     bootstrap_servers='localhost:9092',
-    auto_offset_reset='latest',
-    enable_auto_commit=True
+    auto_offset_reset='earliest',
+    enable_auto_commit=True,
+    group_id='plate-consumer-group',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
 )
+
+# -------------------------
+# STORE ALL RECORDS
+# -------------------------
+all_records = []
 
 # -------------------------
 # MAIN LOOP
 # -------------------------
 for msg in consumer:
-    data = json.loads(msg.value)
-    
-    # decode frame
+    print("📥 Message received")
+
+    data = msg.value
+
+    # Decode frame
     frame_bytes = base64.b64decode(data["frame"])
     np_arr = np.frombuffer(frame_bytes, np.uint8)
     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -67,11 +77,9 @@ for msg in consumer:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         plate = frame[y1:y2, x1:x2]
 
-        # -------------------------
         # OCR
-        # -------------------------
-        plate = cv2.resize(plate, None, fx=4, fy=4)
-        gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
+        plate_resized = cv2.resize(plate, None, fx=4, fy=4)
+        gray = cv2.cvtColor(plate_resized, cv2.COLOR_BGR2GRAY)
 
         ocr_result = reader.readtext(gray)
 
@@ -79,35 +87,67 @@ for msg in consumer:
             text = re.sub('[^A-Z0-9]', '', res[1])
 
             if len(text) >= 6:
-                print("Detected Plate:", text)
+                print("🚗 Detected Plate:", text)
 
-                # -------------------------
-                # SAVE + UPLOAD TO S3
-                # -------------------------
                 timestamp = int(time.time())
-                file_name = f"{text}_{timestamp}.jpg"
+                date_str = time.strftime("%Y-%m-%d")
+                hour_str = time.strftime("%H")
 
-                cv2.imwrite(file_name, plate)
+                image_file = f"{text}_{timestamp}.jpg"
+
+                # SAVE IMAGE
+                cv2.imwrite(image_file, plate)
+
+                image_s3_key = f"bronze/{image_file}"
+                image_s3_path = f"s3://{S3_BUCKET_NAME}/{image_s3_key}"
 
                 try:
-                    s3.upload_file(file_name, S3_BUCKET_NAME, file_name)
-                    print(f"✅ Uploaded to S3: {file_name}")
-
-                    # delete local file
-                    os.remove(file_name)
-
+                    s3.upload_file(image_file, S3_BUCKET_NAME, image_s3_key)
+                    os.remove(image_file)
                 except Exception as e:
-                    print("❌ S3 Upload Error:", e)
+                    print("❌ Image Upload Error:", e)
+                    continue
 
-                # -------------------------
-                # DRAW ON FRAME
-                # -------------------------
-                cv2.putText(frame, text, (x1, y1-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+                # STORE METADATA (NOT uploading yet)
+                metadata = {
+                    "plate_number": text,
+                    "timestamp": timestamp,
+                    "image_path": image_s3_path,
+                    "confidence": float(box.conf[0]),
+                    "camera_id": "cam_01",
+                    "date": date_str,
+                    "hour": hour_str
+                }
+
+                all_records.append(metadata)
 
     cv2.imshow("Kafka YOLO Stream", frame)
 
+    # STOP CONDITION (when video ends OR press q)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+
+# -------------------------
+# AFTER LOOP → CREATE CSV
+# -------------------------
+if all_records:
+    csv_file = f"plates_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=all_records[0].keys())
+        writer.writeheader()
+        writer.writerows(all_records)
+
+    # -------------------------
+    # UPLOAD ONCE
+    # -------------------------
+    s3_key = f"bronze/{csv_file}"
+
+    try:
+        s3.upload_file(csv_file, S3_BUCKET_NAME, s3_key)
+        print(f"📄 Uploaded FINAL CSV: {csv_file}")
+        os.remove(csv_file)
+    except Exception as e:
+        print("❌ Final CSV Upload Error:", e)
 
 cv2.destroyAllWindows()
